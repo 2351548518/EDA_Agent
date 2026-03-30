@@ -45,7 +45,7 @@ EDA_Agent/
 | `ic_sft_data_processing.py` | IC-Textbook教材数据处理，多语言QA生成 |
 | `verilog_sft_data_processing.py` | Verilog代码数据处理，代码问答对生成 |
 | `merge_sft_data.py` | 多源数据合并与去重 |
-| `ch_sft_data_process.py` | 中文医疗数据处理（对比学习） |
+| `ch_sft_data_process.py` | 中文教材数据处理 |
 
 #### 数据格式示例
 
