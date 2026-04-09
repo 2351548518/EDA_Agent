@@ -18,3 +18,8 @@ volumes/
 # OS files
 .DS_Store
 data/
+docs/interview_implementation_flow.md
+docs/interview_metrics_explained.md
+docs/interview_metrics_formulas_examples.md
+docs/interview_speech_scripts.md
+docs/technical_implementation.md
