@@ -1,6 +1,23 @@
 version: '3.5'
 
 services:
+  postgres:
+    container_name: eda-postgres
+    image: postgres:16
+    environment:
+      POSTGRES_DB: eda_agent
+      POSTGRES_USER: eda_user
+      POSTGRES_PASSWORD: eda_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eda_user -d eda_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.18
@@ -59,19 +76,24 @@ services:
       - "9091:9091"
     depends_on:
       - "etcd"
+
   attu:
     container_name: milvus-attu
-    image: zilliz/attu:v2.5.11  
+    image: zilliz/attu:v2.5.11
     environment:
-      - MILVUS_URL=standalone:19530  
+      - MILVUS_URL=standalone:19530
       - PORT=3000
     ports:
       - "8080:3000"
     depends_on:
       - standalone
-    networks:
-      - default  
+
+  adminer:
+    container_name: adminer
+    image: adminer
+    ports:
+      - "8081:8080"
 
 networks:
-  default:
+  milvus:
     name: milvus

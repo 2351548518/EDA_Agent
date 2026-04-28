@@ -1,106 +1,43 @@
-from typing import Literal, TypedDict, List, Optional
-import os
-from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
+"""
+RAG 工作流节点模块 - 定义工作图中每个节点的实现
 
-from rag_utils import retrieve_documents, step_back_expand, generate_hypothetical_document
-from tools import emit_rag_step
+每个节点是一个函数，接收当前状态，返回更新后的状态。
 
-load_dotenv()
+节点列表：
+1. retrieve_initial: 初始检索节点
+2. grade_documents_node: 相关性评估节点
+3. rewrite_question_node: 查询重写节点
+4. retrieve_expanded: 扩展检索节点
+"""
 
-API_KEY = os.getenv("ARK_API_KEY")
-MODEL = os.getenv("MODEL")
-BASE_URL = os.getenv("BASE_URL")
-GRADE_MODEL = os.getenv("GRADE_MODEL")
+from typing import List
 
-_grader_model = None
-_router_model = None
-
-
-def _get_grader_model():
-    global _grader_model
-    if not API_KEY or not GRADE_MODEL:
-        return None
-    if _grader_model is None:
-        _grader_model = init_chat_model(
-            model=GRADE_MODEL,
-            model_provider="openai",
-            api_key=API_KEY,
-            base_url=BASE_URL,
-            temperature=0,
-            stream_usage=True,
-        )
-    return _grader_model
-
-
-def _get_router_model():
-    global _router_model
-    if not API_KEY or not MODEL:
-        return None
-    if _router_model is None:
-        _router_model = init_chat_model(
-            model=MODEL,
-            model_provider="openai",
-            api_key=API_KEY,
-            base_url=BASE_URL,
-            temperature=0,
-            stream_usage=True,
-        )
-    return _router_model
-
-
-# GRADE_PROMPT = (
-#     "You are a grader assessing relevance of a retrieved document to a user question. \n "
-#     "Here is the retrieved document: \n\n {context} \n\n"
-#     "Here is the user question: {question} \n"
-#     "If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n"
-#     "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question."
-# )
-
-GRADE_PROMPT = (
-    "You are a grader assessing relevance of a retrieved document to a user question. \n "
-    "Here is the retrieved document: \n\n {context} \n\n"
-    "Here is the user question: {question} \n"
-    "If the document contains keyword(s) or semantic meaning related to the user question, grade it as relevant. \n"
-    "Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.\n"
-    "Please output your answer as a JSON object."
+from backend.common.prompts import RAG_GRADE_PROMPT, RAG_REWRITE_STRATEGY_PROMPT_TEMPLATE
+from backend.rag.models.rag_models import GradeDocuments, RAGState, RewriteStrategy
+from backend.rag.vector_store.retrieval_service import (
+    generate_hypothetical_document,
+    retrieve_documents,
+    step_back_expand,
 )
-
-
-class GradeDocuments(BaseModel):
-    """Grade documents using a binary score for relevance check."""
-
-    binary_score: str = Field(
-        description="Relevance score: 'yes' if relevant, or 'no' if not relevant",
-        alias="score"
-    )
-
-
-class RewriteStrategy(BaseModel):
-    """Choose a query expansion strategy."""
-
-    strategy: Literal["step_back", "hyde", "complex"]
-
-
-class RAGState(TypedDict):
-    question: str
-    query: str
-    context: str
-    docs: List[dict]
-    route: Optional[str]
-    expansion_type: Optional[str]
-    expanded_query: Optional[str]
-    step_back_question: Optional[str]
-    step_back_answer: Optional[str]
-    hypothetical_doc: Optional[str]
-    rag_trace: Optional[dict]
+from backend.rag.workflows.model_providers import get_grader_model, get_router_model
+from backend.tools.agent_tools import emit_rag_step
 
 
 def _format_docs(docs: List[dict]) -> str:
     """
-    将检索到的文档列表格式化为字符串，供模型理解和使用。每个文档会显示其来源（文件名和页码）以及文本内容，并用分隔符分开。
+    将文档列表格式化为字符串。
+
+    用于：
+    1. 评估时构建提示词
+    2. 返回给 Agent 作为上下文
+
+    Format:
+        [1] filename (Page N):
+        文档内容...
+
+        ---
+        [2] filename (Page N):
+        文档内容...
     """
     if not docs:
         return ""
@@ -114,17 +51,29 @@ def _format_docs(docs: List[dict]) -> str:
 
 
 def retrieve_initial(state: RAGState) -> RAGState:
+    """
+    初始检索节点。
+
+    使用原始查询执行混合检索，并记录追踪信息。
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        更新后的状态（包含 docs, context, rag_trace）
+    """
     query = state["question"]
     emit_rag_step("🔍", "正在检索知识库...", f"查询: {query[:50]}")
+
+    # 执行检索
     retrieved = retrieve_documents(query, top_k=5)
     results = retrieved.get("docs", [])
-    # print(results[0].keys() if results else "No results")
-    """
-    results[0].keys()
-    dict_keys(['id', 'text', 'filename', 'file_type', 'page_number', 'chunk_id', 'parent_chunk_id', 'root_chunk_id', 'chunk_level', 'chunk_idx', 'score', 'rrf_rank', 'rerank_score'])
-    """
     retrieve_meta = retrieved.get("meta", {})
+
+    # 格式化上下文
     context = _format_docs(results)
+
+    # 发送 RAG 步骤信息
     emit_rag_step(
         "🧱",
         "三级分块检索",
@@ -143,6 +92,8 @@ def retrieve_initial(state: RAGState) -> RAGState:
         ),
     )
     emit_rag_step("✅", f"检索完成，找到 {len(results)} 个片段", f"模式: {retrieve_meta.get('retrieval_mode', 'hybrid')}")
+
+    # 构建追踪信息
     rag_trace = {
         "tool_used": True,
         "tool_name": "search_knowledge_base",
@@ -165,24 +116,7 @@ def retrieve_initial(state: RAGState) -> RAGState:
         "auto_merge_replaced_chunks": retrieve_meta.get("auto_merge_replaced_chunks"),
         "auto_merge_steps": retrieve_meta.get("auto_merge_steps"),
     }
-    """
-    class RAGState(TypedDict):
-    question: str
-    query: str
-    context: str
-    docs: List[dict]
-    route: Optional[str]
-    expansion_type: Optional[str]
-    expanded_query: Optional[str]
-    step_back_question: Optional[str]
-    step_back_answer: Optional[str]
-    hypothetical_doc: Optional[str]
-    rag_trace: Optional[dict]
 
-    retrieve_initial 函数返回的字典里不包含 question 字段是允许的，因为在整个 RAG 流程中，question 字段一般只在初始输入时需要，后续节点会自动继承上一个 state 的所有字段。
-
-    只要初始 state 里有 question，后续节点即使只返回部分字段，框架会自动合并（保留未被覆盖的字段）。
-    """
     return {
         "query": query,
         "docs": results,
@@ -192,9 +126,26 @@ def retrieve_initial(state: RAGState) -> RAGState:
 
 
 def grade_documents_node(state: RAGState) -> RAGState:
-    grader = _get_grader_model()
+    """
+    相关性评估节点。
+
+    使用 LLM 判断检索到的文档是否与问题相关。
+    如果不相关，需要进行查询扩展。
+
+    路由决策：
+    - "yes" -> generate_answer（直接生成答案）
+    - "no" -> rewrite_question（重写查询）
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        更新后的状态（包含 route, rag_trace）
+    """
+    grader = get_grader_model()
     emit_rag_step("📊", "正在评估文档相关性...")
 
+    # 如果没有配置 grader 模型，默认进行重写
     if not grader:
         grade_update = {
             "grade_score": "unknown",
@@ -203,22 +154,27 @@ def grade_documents_node(state: RAGState) -> RAGState:
         }
         rag_trace = state.get("rag_trace", {}) or {}
         rag_trace.update(grade_update)
-        # route 字段（值为 "rewrite_question"，指示后续流程应该进入重写问题的分支）和更新后的 rag_trace。这种设计可以让后续流程节点根据 route 字段做出相应处理，同时保留完整的流程追踪信息
         return {"route": "rewrite_question", "rag_trace": rag_trace}
-    
+
+    # 构建评估提示词
     question = state["question"]
     context = state.get("context", "")
-    prompt = GRADE_PROMPT.format(question=question, context=context)
-    response = grader.with_structured_output(GradeDocuments).invoke(
+    prompt = RAG_GRADE_PROMPT.format(question=question, context=context)
+
+    # 调用 LLM 进行评估
+    response = grader.with_structured_output(GradeDocuments, include_raw=False).invoke(
         [{"role": "user", "content": prompt}]
     )
-    score = (response.binary_score or "").strip().lower()
+    score = (response.score or "").strip().lower()
 
+    # 根据评分决定路由
     route = "generate_answer" if score == "yes" else "rewrite_question"
     if route == "generate_answer":
         emit_rag_step("✅", "文档相关性评估通过", f"评分: {score}")
     else:
         emit_rag_step("⚠️", "文档相关性不足，将重写查询", f"评分: {score}")
+
+    # 更新追踪信息
     grade_update = {
         "grade_score": score,
         "grade_route": route,
@@ -231,46 +187,43 @@ def grade_documents_node(state: RAGState) -> RAGState:
 
 
 def rewrite_question_node(state: RAGState) -> RAGState:
+    """
+    查询重写节点。
+
+    根据策略选择使用不同的查询扩展方法：
+    - step_back: 生成退步问题，理解问题的通用原理
+    - hyde: 生成假设性文档，帮助检索相关文档
+    - complex: 同时使用 step_back 和 hyde
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        更新后的状态（包含扩展策略相关字段）
+    """
     question = state["question"]
     emit_rag_step("✏️", "正在重写查询...")
-    router = _get_router_model()
-    strategy = "step_back" # 默认策略是 step_back，如果模型调用失败也会回退到这个策略，保证流程的鲁棒性
+
+    # 获取路由模型，选择扩展策略
+    router = get_router_model()
+    strategy = "step_back"  # 默认策略
     if router:
-        # prompt = (
-        #     "请根据用户问题选择最合适的查询扩展策略，仅输出策略名。\n"
-        #     "- step_back：包含具体名称、日期、代码等细节，需要先理解通用概念的问题。\n"
-        #     "- hyde：模糊、概念性、需要解释或定义的问题。\n"
-        #     "- complex：多步骤、需要分解或综合多种信息的复杂问题。\n"
-        #     f"用户问题：{question}"
-        # )
-        """
-        默认用的是 json_schema 模式，但你的模型（Qwen via ModelScope）不支持，导致返回 choices=None。
-
-        解决方法是改用 method="json_mode"，同时 prompt 里要有 "json" 这个词（已经有了）：
-
-        根本原因：langchain-openai >= 0.3.0 默认改成了 json_schema 模式，这个模式依赖 OpenAI 原生的 structured outputs API，第三方兼容接口（ModelScope/Qwen）通常不支持，只支持更基础的 json_object 模式。
-
-        """
-        prompt = (
-            "请根据用户问题选择最合适的查询扩展策略，以 JSON 格式输出策略名。\n"
-            "- step_back：包含具体名称、日期、代码等细节，需要先理解通用概念的问题。\n"
-            "- hyde：模糊、概念性、需要解释或定义的问题。\n"
-            "- complex：多步骤、需要分解或综合多种信息的复杂问题。\n"
-            f"用户问题：{question}"
-        )
+        prompt = RAG_REWRITE_STRATEGY_PROMPT_TEMPLATE.format(question=question)
         try:
-            decision = router.with_structured_output(RewriteStrategy).invoke(
+            decision = router.with_structured_output(RewriteStrategy, include_raw=False).invoke(
                 [{"role": "user", "content": prompt}]
             )
             strategy = decision.strategy
         except Exception:
             strategy = "step_back"
 
+    # 各策略的初始值
     expanded_query = question
     step_back_question = ""
     step_back_answer = ""
     hypothetical_doc = ""
 
+    # 执行 Step-back 策略
     if strategy in ("step_back", "complex"):
         emit_rag_step("🧠", f"使用策略: {strategy}", "生成退步问题")
         step_back = step_back_expand(question)
@@ -278,10 +231,12 @@ def rewrite_question_node(state: RAGState) -> RAGState:
         step_back_answer = step_back.get("step_back_answer", "")
         expanded_query = step_back.get("expanded_query", question)
 
+    # 执行 HyDE 策略
     if strategy in ("hyde", "complex"):
         emit_rag_step("📝", "HyDE 假设性文档生成中...")
         hypothetical_doc = generate_hypothetical_document(question)
 
+    # 更新追踪信息
     rag_trace = state.get("rag_trace", {}) or {}
     rag_trace.update({
         "rewrite_strategy": strategy,
@@ -299,9 +254,26 @@ def rewrite_question_node(state: RAGState) -> RAGState:
 
 
 def retrieve_expanded(state: RAGState) -> RAGState:
+    """
+    扩展检索节点。
+
+    根据选择的扩展策略，执行相应的扩展检索：
+    - hyde/complex: 用假设性文档检索
+    - step_back/complex: 用扩展后的查询检索
+
+    合并所有扩展检索的结果，进行去重和排序。
+
+    Args:
+        state: 当前状态
+
+    Returns:
+        更新后的状态（包含 docs, context, rag_trace）
+    """
     strategy = state.get("expansion_type") or "step_back"
     emit_rag_step("🔄", "使用扩展查询重新检索...", f"策略: {strategy}")
+
     results: List[dict] = []
+    # 追踪各维度的元信息
     rerank_applied_any = False
     rerank_enabled_any = False
     rerank_model = None
@@ -316,16 +288,13 @@ def retrieve_expanded(state: RAGState) -> RAGState:
     auto_merge_replaced_chunks = 0
     auto_merge_steps = 0
 
-    """
-    首先，如果 strategy 是 "hyde" 或 "complex"，代码会尝试获取 state 中的 hypothetical_doc（假设文档），如果没有则通过当前问题生成一个。然后用这个假设文档进行检索，获取相关文档（top_k=5），并将检索到的文档加入 results 列表。接着，提取检索元信息 hyde_meta，并通过 emit_rag_step 记录检索过程的详细信息（如召回层级、候选数量、合并替换块数等）。随后，代码会根据 hyde_meta 更新一系列与 rerank（重排序）、检索模式、合并等相关的变量，并统计可能出现的错误和步骤。
-
-    接下来，如果 strategy 是 "step_back" 或 "complex"，代码会获取扩展查询 expanded_query（优先取 state 中的 expanded_query，否则用原始问题），同样进行文档检索并将结果加入 results。后续处理与 HyDE 类似：提取 step_meta，记录检索过程，更新相关变量和统计信息。
-    """
+    # HyDE 检索
     if strategy in ("hyde", "complex"):
         hypothetical_doc = state.get("hypothetical_doc") or generate_hypothetical_document(state["question"])
         retrieved_hyde = retrieve_documents(hypothetical_doc, top_k=5)
         results.extend(retrieved_hyde.get("docs", []))
         hyde_meta = retrieved_hyde.get("meta", {})
+
         emit_rag_step(
             "🧱",
             "HyDE 三级检索",
@@ -335,6 +304,8 @@ def retrieve_expanded(state: RAGState) -> RAGState:
                 f"合并替换 {hyde_meta.get('auto_merge_replaced_chunks', 0)}"
             ),
         )
+
+        # 收集元信息
         rerank_applied_any = rerank_applied_any or bool(hyde_meta.get("rerank_applied"))
         rerank_enabled_any = rerank_enabled_any or bool(hyde_meta.get("rerank_enabled"))
         rerank_model = rerank_model or hyde_meta.get("rerank_model")
@@ -350,11 +321,13 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(hyde_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(hyde_meta.get("auto_merge_steps") or 0)
 
+    # Step-back 检索
     if strategy in ("step_back", "complex"):
         expanded_query = state.get("expanded_query") or state["question"]
         retrieved_stepback = retrieve_documents(expanded_query, top_k=5)
         results.extend(retrieved_stepback.get("docs", []))
         step_meta = retrieved_stepback.get("meta", {})
+
         emit_rag_step(
             "🧱",
             "Step-back 三级检索",
@@ -364,6 +337,8 @@ def retrieve_expanded(state: RAGState) -> RAGState:
                 f"合并替换 {step_meta.get('auto_merge_replaced_chunks', 0)}"
             ),
         )
+
+        # 收集元信息
         rerank_applied_any = rerank_applied_any or bool(step_meta.get("rerank_applied"))
         rerank_enabled_any = rerank_enabled_any or bool(step_meta.get("rerank_enabled"))
         rerank_model = rerank_model or step_meta.get("rerank_model")
@@ -379,6 +354,7 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         auto_merge_replaced_chunks += int(step_meta.get("auto_merge_replaced_chunks") or 0)
         auto_merge_steps += int(step_meta.get("auto_merge_steps") or 0)
 
+    # 去重
     deduped = []
     seen = set()
     for item in results:
@@ -388,13 +364,15 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         seen.add(key)
         deduped.append(item)
 
-    # 扩展阶段可能合并了多路召回（如 hyde + step_back），
-    # 这里统一重排展示名次，避免出现 1,2,3,4,5,4,5 这类重复名次。
+    # 分配 RRF 排名
     for idx, item in enumerate(deduped, 1):
         item["rrf_rank"] = idx
 
+    # 格式化上下文
     context = _format_docs(deduped)
     emit_rag_step("✅", f"扩展检索完成，共 {len(deduped)} 个片段")
+
+    # 更新追踪信息
     rag_trace = state.get("rag_trace", {}) or {}
     rag_trace.update({
         "expanded_query": state.get("expanded_query") or state["question"],
@@ -419,56 +397,5 @@ def retrieve_expanded(state: RAGState) -> RAGState:
         "auto_merge_replaced_chunks": auto_merge_replaced_chunks,
         "auto_merge_steps": auto_merge_steps,
     })
-    """
-    deduped = [
-    {'id': '...', 'text': '...', 'filename': '...', 'page_number': 1, ...},
-    {'id': '...', 'text': '...', 'filename': '...', 'page_number': 2, ...},
-     ...
-    ]
 
-    context = "[1] file1.pdf (Page 1):\n文本内容...\n\n---\n\n[2] file2.pdf (Page 2):\n文本内容...\n\n---\n\n..."
-
-    
-    """
     return {"docs": deduped, "context": context, "rag_trace": rag_trace}
-
-
-def build_rag_graph():
-    graph = StateGraph(RAGState)
-    graph.add_node("retrieve_initial", retrieve_initial)
-    graph.add_node("grade_documents", grade_documents_node)
-    graph.add_node("rewrite_question", rewrite_question_node)
-    graph.add_node("retrieve_expanded", retrieve_expanded)
-
-    graph.set_entry_point("retrieve_initial")
-    graph.add_edge("retrieve_initial", "grade_documents")
-    graph.add_conditional_edges(
-        "grade_documents",
-        lambda state: state.get("route"),
-        {
-            "generate_answer": END,
-            "rewrite_question": "rewrite_question",
-        },
-    )
-    graph.add_edge("rewrite_question", "retrieve_expanded")
-    graph.add_edge("retrieve_expanded", END)
-    return graph.compile()
-
-
-rag_graph = build_rag_graph()
-
-
-def run_rag_graph(question: str) -> dict:
-    return rag_graph.invoke({
-        "question": question,
-        "query": question,
-        "context": "",
-        "docs": [],
-        "route": None,
-        "expansion_type": None,
-        "expanded_query": None,
-        "step_back_question": None,
-        "step_back_answer": None,
-        "hypothetical_doc": None,
-        "rag_trace": None,
-    })
