@@ -2,16 +2,38 @@
 
 本项目是一个面向集成电路（EDA/IC）领域的智能问答系统，基于 RAG（检索增强生成）架构，结合领域专属的大语言模型，提供专业的技术问答服务。
 
+
+## 🔗 模型与数据集资源
+
+<div align="center">
+
+| 类型 | 资源 | 说明 | 链接 |
+|:---:|:---|:---|:---:|
+| 🤖 **LLM** | **Qwen3-8B-IC** | 面向 IC/EDA 领域微调的主对话生成模型 | [![HuggingFace Model](https://img.shields.io/badge/🤗%20Model-Qwen3--8B--IC-yellow?style=for-the-badge)](https://huggingface.co/ZeeoRe/Qwen3-8B-IC) |
+| 🧭 **Reranker** | **Qwen3-Reranker-4B-IC** | 面向领域知识检索的相关性精排模型 | [![HuggingFace Model](https://img.shields.io/badge/🤗%20Model-Qwen3--Reranker--4B--IC-orange?style=for-the-badge)](https://huggingface.co/ZeeoRe/Qwen3-Reranker-4B-IC) |
+| 🧬 **Embedding** | **Qwen3-Embedding-4B-IC** | 面向 EDA/IC 文档语义检索的向量编码模型 | [![HuggingFace Model](https://img.shields.io/badge/🤗%20Model-Qwen3--Embedding--4B--IC-blue?style=for-the-badge)](https://huggingface.co/ZeeoRe/Qwen3-Embedding-4B-IC) |
+| 📚 **Dataset** | **EDA_RAG_7k** | 用于领域 SFT / RAG 训练的约 7K 条高质量数据集 | [![HuggingFace Dataset](https://img.shields.io/badge/🤗%20Dataset-EDA__RAG__7k-green?style=for-the-badge)](https://huggingface.co/datasets/ZeeoRe/EDA_RAG_7k) |
+
+</div>
+
+> 💡 以上资源均已发布至 Hugging Face，可直接用于模型加载、微调复现与 RAG 系统部署。
+
+
 ## 项目架构概览
 
 ```
 EDA_Agent/
-├── EDA_data/          # 数据处理层：多源数据获取与SFT数据构建
-├── EDA_Model/         # 模型层：领域模型微调与部署
-└── EDA_Agent/         # 应用层：RAG系统与Web服务
-    ├── backend/       # FastAPI后端服务
-    ├── frontend/      # Vue3前端界面
-    └── data/          # 本地数据存储
+├── EDA_data/                  # 数据处理层：SFT/评测数据处理与合并
+│   └── data_process/          # 多源数据清洗、转换、合并脚本
+├── EDA_Model/                 # 模型层：Qwen3 微调、评估与部署
+│   ├── Qwen3_8B/              # 主模型 LoRA SFT、评估、合并
+│   ├── Qwen3_Emb_Rerank/      # Embedding/Reranker 数据处理与上传
+│   └── deploy/vllm/           # vLLM 部署与 OpenAI 兼容接口测试
+└── EDA_Agent/                 # 应用层：RAG 系统与 Web 服务
+    ├── backend/               # FastAPI 后端、Agent、RAG、存储与工具
+    ├── frontend/              # Vue3 静态前端界面
+    ├── docker-compose.yml     # PostgreSQL、Milvus、MinIO、etcd、Attu、Adminer
+    └── pyproject.toml         # Python 项目依赖配置
 ```
 
 ---
@@ -368,46 +390,85 @@ uv run uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 EDA_Agent/
 ├── EDA_data/                          # 数据处理层
-│   ├── data/                          # 数据获取与清洗
-│   │   ├── clean_mineru_md.py         # Markdown清洗
-│   │   ├── pdf_mineru_to_clean_json_langchain.py  # PDF解析
-│   │   ├── down_IC_Textbook_Dataset.py
-│   │   └── down_MG_Verilog.py
-│   └── data_process/                  # SFT数据处理
+│   └── data_process/                  # SFT/评测数据处理
+│       ├── data_process.ipynb
+│       ├── sft_data_processing.ipynb
 │       ├── eda_sft_data_processing.py
 │       ├── ic_sft_data_processing.py
+│       ├── ch_sft_data_process.py
 │       ├── verilog_sft_data_processing.py
+│       ├── test_processing.py
+│       ├── merge_jsonl.py
 │       └── merge_sft_data.py
 │
 ├── EDA_Model/                         # 模型层
 │   ├── Qwen3_8B/                      # 主模型微调
 │   │   ├── train.py                   # LoRA训练脚本
+│   │   ├── test.py                    # 推理测试脚本
+│   │   ├── sft.ipynb
+│   │   ├── test.ipynb
 │   │   ├── evaluate_qwen.py           # 模型评估
 │   │   ├── merge_lora.py              # LoRA合并
-│   │   └── upload_hf.py               # 上传HuggingFace
+│   │   ├── upload_hf.py               # 上传HuggingFace
+│   │   ├── ds_z2_offload_config.json
+│   │   ├── ds_zero2_no_offload.json
+│   │   ├── ds_z3_offload_config.json
+│   │   ├── metric/                    # ROUGE/BLEU/BERTScore等评估脚本
+│   │   └── results/                   # 评估结果
 │   ├── Qwen3_Emb_Rerank/              # Embedding/Reranker微调
 │   │   ├── emb_data_process.py
 │   │   ├── reranker_data_process.py
-│   │   └── sft_emb_rerankder.ipynb
+│   │   ├── convert_reranker_data.py
+│   │   ├── sft_emb_rerankder.ipynb
+│   │   ├── upload_hf.py
+│   │   └── upload_hf_reranker.py
 │   └── deploy/vllm/                   # 模型部署
-│       └── vllm_Qwen3.ipynb
+│       ├── vllm_Qwen3.ipynb
+│       └── openai_test.ipynb
 │
 └── EDA_Agent/                         # 应用层
     ├── backend/                       # FastAPI后端
     │   ├── app.py                     # 应用入口
-    │   ├── agent.py                   # LangChain Agent
-    │   ├── api.py                     # API路由
-    │   ├── rag_pipeline.py            # RAG流程
-    │   ├── milvus_client.py           # 向量检索
-    │   ├── embedding.py               # 向量编码
-    │   ├── document_loader.py         # 文档处理
-    │   └── tools.py                   # 工具定义
+    │   ├── env.example                # 环境变量示例
+    │   ├── api/                       # API路由与Schema
+    │   │   ├── routes.py
+    │   │   └── schemas.py
+    │   ├── agent/                     # LangChain Agent服务
+    │   │   └── service.py
+    │   ├── common/                    # 路径、提示词、上传任务队列
+    │   │   ├── paths.py
+    │   │   ├── prompts.py
+    │   │   └── upload_jobs.py
+    │   ├── db/                        # PostgreSQL连接
+    │   │   └── postgres.py
+    │   ├── memory/                    # 会话历史存储
+    │   │   └── storage.py
+    │   ├── rag/                       # RAG工作流与向量检索
+    │   │   ├── models/
+    │   │   ├── workflows/
+    │   │   │   ├── graph_builder.py
+    │   │   │   ├── model_providers.py
+    │   │   │   ├── nodes.py
+    │   │   │   └── pipeline.py
+    │   │   └── vector_store/
+    │   │       ├── document_loader.py
+    │   │       ├── embedding.py
+    │   │       ├── milvus_client.py
+    │   │       ├── milvus_writer.py
+    │   │       ├── parent_chunk_store.py
+    │   │       └── retrieval_service.py
+    │   ├── tools/                     # Agent工具与维护脚本
+    │   │   ├── agent_tools.py
+    │   │   └── reset_milvus.py
+    │   ├── mcp/
+    │   └── test/
     ├── frontend/                      # Vue3前端
     │   ├── index.html
     │   ├── script.js
     │   └── style.css
-    ├── data/                          # 本地数据
-    └── docker-compose.yml             # Milvus部署
+    ├── docker-compose.yml             # PostgreSQL/Milvus等基础服务
+    ├── pyproject.toml                 # Python依赖配置
+    └── uv.lock
 ```
 
 ---
