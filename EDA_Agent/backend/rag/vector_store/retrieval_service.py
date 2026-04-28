@@ -29,17 +29,15 @@ query -> 混合检索 -> 重排序 -> Auto-merging -> 返回结果
 """
 
 from collections import defaultdict
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 import os
 import json
-import re
 import requests
 from dotenv import load_dotenv
 
 from backend.rag.vector_store.milvus_client import MilvusManager
 from backend.rag.vector_store.embedding import EmbeddingService
 from backend.rag.vector_store.parent_chunk_store import ParentChunkStore
-from backend.memory.chunk_image_storage import chunk_image_storage
 from backend.common.prompts import (
     HYDE_PROMPT_TEMPLATE,
     STEP_BACK_ANSWER_PROMPT_TEMPLATE,
@@ -66,9 +64,6 @@ LEAF_RETRIEVE_LEVEL = int(os.getenv("LEAF_RETRIEVE_LEVEL", "3"))  # 检索层级
 _embedding_service = EmbeddingService()
 _milvus_manager = MilvusManager()
 _parent_chunk_store = ParentChunkStore()
-
-# 图片占位符正则
-_IMAGE_PH_RE = re.compile(r"<<IMAGE:([0-9a-f]{8})>>")
 
 _stepback_model = None
 
@@ -387,90 +382,16 @@ def step_back_expand(query: str) -> dict:
     }
 
 
-def _extract_image_tokens(text: str) -> List[str]:
-    """
-    从文本中提取图片占位符 token。
-
-    Args:
-        text: 包含占位符的文本
-
-    Returns:
-        token 列表
-    """
-    matches = _IMAGE_PH_RE.findall(text)
-    return matches
-
-
-def _enrich_chunks_with_images(chunks: List[dict]) -> List[dict]:
-    """
-    为检索到的文本 chunk 补全图片信息。
-
-    流程：
-    1. 提取每个 chunk 中的图片 token
-    2. 批量查询 PostgreSQL 获取图片信息
-    3. 将占位符替换为真实 URL
-
-    Args:
-        chunks: 检索到的文本 chunk 列表
-
-    Returns:
-         enriched 后的 chunk 列表
-    """
-    if not chunks:
-        return chunks
-
-    # 收集所有 chunk_id 和 image_tokens
-    chunk_ids = [c.get("chunk_id") for c in chunks if c.get("chunk_id")]
-    if not chunk_ids:
-        return chunks
-
-    # 查询图片映射
-    image_records = chunk_image_storage.get_by_chunk_ids(chunk_ids)
-    if not image_records:
-        return chunks
-
-    # 建立 token -> image_info 的映射
-    token_to_image: Dict[str, dict] = {}
-    for record in image_records:
-        token = record.get("image_token", "")
-        if token:
-            token_to_image[token] = record
-
-    # 为每个 chunk 补全图片
-    for chunk in chunks:
-        text = chunk.get("text", "")
-        tokens = _extract_image_tokens(text)
-
-        images = []
-        for token in tokens:
-            if token in token_to_image:
-                img_info = token_to_image[token]
-                images.append({
-                    "image_token": token,
-                    "placeholder": img_info.get("placeholder", f"<<IMAGE:{token}>>"),
-                    "image_path": img_info.get("image_path", ""),
-                    "mime_type": img_info.get("mime_type", "image/png"),
-                    "width": img_info.get("width"),
-                    "height": img_info.get("height"),
-                })
-
-        chunk["images"] = images
-        chunk["image_count"] = len(images)
-
-    return chunks
-
-
 def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
     """
     核心检索函数。
 
     完整检索流程：
     1. 生成查询向量（密集 + 稀疏）
-    2. 执行混合检索（仅 text 记录）
+    2. 执行混合检索
     3. 执行重排序
     4. 执行 Auto-merging
-    5. 补全图片信息
-    6. 返回结果和元信息
+    5. 返回结果和元信息
 
     如果混合检索失败，降级为纯密集向量检索。
 
@@ -486,7 +407,7 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
     # 候选数量，多取一些用于后续筛选
     candidate_k = max(top_k * 3, top_k)
 
-    # 默认只检索叶子分块（L3）+ 仅 text 记录
+    # 默认只检索叶子分块（L3）
     filter_expr = f"chunk_level == {LEAF_RETRIEVE_LEVEL}"
 
     try:
@@ -495,13 +416,12 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
         dense_embedding = dense_embeddings[0]
         sparse_embedding = _embedding_service.get_sparse_embedding(query)
 
-        # 混合检索（过滤 record_type = "text"）
+        # 混合检索
         retrieved = _milvus_manager.hybrid_retrieve(
             dense_embedding=dense_embedding,
             sparse_embedding=sparse_embedding,
             top_k=candidate_k,
             filter_expr=filter_expr,
-            record_type="text",
         )
 
         # 重排序
@@ -509,9 +429,6 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
 
         # Auto-merging
         merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-
-        # 补全图片信息
-        merged_docs = _enrich_chunks_with_images(merged_docs)
 
         # 组装元信息
         rerank_meta["retrieval_mode"] = "hybrid"
@@ -531,14 +448,10 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
                 dense_embedding=dense_embedding,
                 top_k=candidate_k,
                 filter_expr=filter_expr,
-                record_type="text",
             )
 
             reranked, rerank_meta = _rerank_documents(query=query, docs=retrieved, top_k=top_k)
             merged_docs, merge_meta = _auto_merge_documents(docs=reranked, top_k=top_k)
-
-            # 补全图片信息
-            merged_docs = _enrich_chunks_with_images(merged_docs)
 
             rerank_meta["retrieval_mode"] = "dense_fallback"
             rerank_meta["candidate_k"] = candidate_k
@@ -568,77 +481,3 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
                     "candidate_count": 0,
                 },
             }
-
-
-def retrieve_images(
-    image_data: bytes,
-    top_k: int = 5,
-) -> Dict[str, Any]:
-    """
-    图片检索函数。
-
-    完整检索流程：
-    1. 对查询图片生成向量
-    2. 在 Milvus 中检索 image 记录
-    3. 根据 chunk_id 回溯获取文本上下文
-    4. 返回图片命中结果和文本上下文
-
-    Args:
-        image_data: 查询图片的字节数据
-        top_k: 返回结果数量
-
-    Returns:
-        包含以下键的字典：
-        - image_hits: 图片检索命中结果
-        - text_contexts: 关联的文本上下文 chunk
-        - meta: 检索过程的元信息
-    """
-    try:
-        # 生成图片向量
-        image_embedding = _embedding_service.embed_image(image_data)
-        if image_embedding is None:
-            return {
-                "image_hits": [],
-                "text_contexts": [],
-                "meta": {"retrieval_mode": "failed", "error": "image_embedding_failed"},
-            }
-
-        # 图片向量检索
-        image_hits = _milvus_manager.image_retrieve(
-            image_embedding=image_embedding,
-            top_k=top_k,
-        )
-
-        # 收集 chunk_id，回溯文本上下文
-        chunk_ids = [hit.get("chunk_id") for hit in image_hits if hit.get("chunk_id")]
-        root_chunk_ids = [hit.get("root_chunk_id") for hit in image_hits if hit.get("root_chunk_id")]
-
-        # 查询文本上下文
-        all_chunk_ids = list(set(chunk_ids + root_chunk_ids))
-        text_contexts = []
-
-        if all_chunk_ids:
-            # 从 Milvus 获取文本 chunk
-            text_chunks = _milvus_manager.get_chunks_by_ids(all_chunk_ids)
-            # 只保留 text 类型的 chunk
-            text_contexts = [c for c in text_chunks if c.get("record_type") == "text"]
-
-            # 补全图片信息
-            text_contexts = _enrich_chunks_with_images(text_contexts)
-
-        return {
-            "image_hits": image_hits,
-            "text_contexts": text_contexts,
-            "meta": {
-                "retrieval_mode": "image",
-                "image_count": len(image_hits),
-                "context_count": len(text_contexts),
-            },
-        }
-
-    except Exception as e:
-        return {
-            "image_hits": [],
-            "text_contexts": [],
-            "meta": {"retrieval_mode": "failed", "error": str(e)},
-        }

@@ -18,11 +18,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse, FileResponse
-from pydantic import BaseModel
-from urllib.parse import quote
+from fastapi.responses import StreamingResponse
 
 # 导入请求/响应模型
 from backend.api.schemas import (
@@ -47,33 +44,11 @@ from backend.rag.vector_store.parent_chunk_store import ParentChunkStore
 from backend.rag.vector_store.milvus_writer import MilvusWriter
 from backend.rag.vector_store.milvus_client import MilvusManager
 from backend.rag.vector_store.embedding import EmbeddingService
-from backend.memory.chunk_image_storage import chunk_image_storage
 from backend.common.paths import DATA_DIR
 from backend.common.upload_jobs import upload_job_registry
 
 # 文档上传存储目录
 UPLOAD_DIR = DATA_DIR / "documents"
-IMAGE_ASSET_DIR = DATA_DIR / "images"
-
-# 启动时确保目录存在
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(IMAGE_ASSET_DIR, exist_ok=True)
-
-
-def _ext_from_mime(mime_type: str) -> str:
-    """根据 MIME 类型推断图片后缀。"""
-    mime = (mime_type or "").lower()
-    if "jpeg" in mime or "jpg" in mime:
-        return ".jpg"
-    if "png" in mime:
-        return ".png"
-    if "webp" in mime:
-        return ".webp"
-    if "gif" in mime:
-        return ".gif"
-    if "bmp" in mime:
-        return ".bmp"
-    return ".bin"
 
 # 全局单例组件（避免重复初始化，提升性能）
 # DocumentLoader: 负责加载和分片文档
@@ -103,8 +78,7 @@ def _process_document_upload(task_id: str, file_path: str, filename: str) -> Non
     1. 加载文档并进行三层分块（L1/L2/L3）
     2. 将 L1 和 L2 父级分块写入 PostgreSQL
     3. 将 L3 叶子分块写入 Milvus 向量数据库
-    4. 保存图片占位符映射到 PostgreSQL
-    5. 更新任务状态
+    4. 更新任务状态
 
     Args:
         task_id: 上传任务的唯一标识
@@ -115,96 +89,31 @@ def _process_document_upload(task_id: str, file_path: str, filename: str) -> Non
     upload_job_registry.update_job(task_id, status="processing", message="正在切片和向量化...")
 
     try:
-        # 1. 加载文档并分片（返回三层分块和图片资产）
-        chunks, image_assets = loader.load_document(file_path, filename)
-        if not chunks:
+        # 1. 加载文档并分片（返回三层分块）
+        new_docs = loader.load_document(file_path, filename)
+        if not new_docs:
             raise RuntimeError("文档处理失败，未能提取内容")
 
         # 2. 分离父级分块（L1、L2）和叶子分块（L3）
         # L1/L2 存储在 PostgreSQL（ParentChunkStore），用于 Auto-merging
         # L3 是最小单元，存储在 Milvus 用于向量检索
-        parent_docs = [doc for doc in chunks if int(doc.get("chunk_level", 0) or 0) in (1, 2)]
-        leaf_docs = [doc for doc in chunks if int(doc.get("chunk_level", 0) or 0) == 3]
+        parent_docs = [doc for doc in new_docs if int(doc.get("chunk_level", 0) or 0) in (1, 2)]
+        leaf_docs = [doc for doc in new_docs if int(doc.get("chunk_level", 0) or 0) == 3]
 
         if not leaf_docs:
             raise RuntimeError("文档处理失败，未生成可检索叶子分块")
 
-        # 3. 构建图片记录（用于 Milvus 和 PostgreSQL）
-        milvus_image_records = []
-        if image_assets:
-            os.makedirs(IMAGE_ASSET_DIR, exist_ok=True)
-
-            # 建立 chunk_id -> root_chunk_id 的映射
-            chunk_to_root = {}
-            for chunk in chunks:
-                cid = chunk.get("chunk_id", "")
-                root = chunk.get("root_chunk_id", "")
-                if cid and root:
-                    chunk_to_root[cid] = root
-
-            for asset in image_assets:
-                chunk_id = asset.get("chunk_id", "")
-                token = asset.get("image_token", "")
-                mime_type = asset.get("mime_type", "image/png")
-                image_bytes = asset.get("image_bytes")
-
-                # 落盘原图，供后续通过 API 读取
-                ext = _ext_from_mime(mime_type)
-                asset_filename = f"{task_id}_{token}{ext}"
-                local_image_path = IMAGE_ASSET_DIR / asset_filename
-                if image_bytes:
-                    with open(local_image_path, "wb") as img_file:
-                        img_file.write(image_bytes)
-
-                # 对外可访问路径（方案1：通过后端接口读取）
-                image_url_path = f"/images/{quote(filename, safe='')}/{token}"
-
-                # 构建图片记录
-                image_id = f"img_{task_id}_{token}"
-                image_record = {
-                    "image_id": image_id,
-                    "image_token": token,
-                    "placeholder": asset.get("placeholder", ""),
-                    "chunk_id": chunk_id,
-                    "root_chunk_id": chunk_to_root.get(chunk_id, ""),
-                    "page_number": asset.get("page_number", 0),
-                    "filename": filename,
-                    "file_type": "image",
-                    "image_path": image_url_path,
-                    "image_bytes": image_bytes,
-                    "mime_type": mime_type,
-                    "width": asset.get("width"),
-                    "height": asset.get("height"),
-                }
-                milvus_image_records.append(image_record)
-
-                # 保存到 PostgreSQL（映射表）
-                asset["task_id"] = task_id
-                asset["filename"] = filename
-                asset["image_id"] = image_id
-                asset["root_chunk_id"] = image_record["root_chunk_id"]
-                asset["image_path"] = image_url_path
-                asset["metadata"] = {
-                    **(asset.get("metadata") or {}),
-                    "local_path": str(local_image_path),
-                }
-
-        # 4. 写入存储
+        # 3. 写入存储
         parent_chunk_store.upsert_documents(parent_docs)  # 父级分块 -> PostgreSQL
-        # 叶子分块和图片记录 -> Milvus
-        milvus_writer.write_documents_and_images(leaf_docs, milvus_image_records)
+        milvus_writer.write_documents(leaf_docs)          # 叶子分块 -> Milvus
 
-        # 5. 保存图片映射到 PostgreSQL
-        if image_assets:
-            chunk_image_storage.save_many(image_assets)
-
-        # 6. 更新任务状态为"已完成"
+        # 4. 更新任务状态为"已完成"
         upload_job_registry.update_job(
             task_id,
             status="completed",
             message=(
                 f"成功上传并处理 {filename}，叶子分块 {len(leaf_docs)} 个，"
-                f"父级分块 {len(parent_docs)} 个，图片 {len(milvus_image_records)} 张（已完成异步处理）"
+                f"父级分块 {len(parent_docs)} 个（已完成异步处理）"
             ),
             chunks_processed=len(leaf_docs),
             finished_at=datetime.now(timezone.utc).isoformat(),
@@ -225,34 +134,6 @@ def _process_document_upload(task_id: str, file_path: str, filename: str) -> Non
 upload_job_registry.set_processor(_process_document_upload)
 
 
-@router.get("/images/{filename}/{image_token}")
-async def get_image_asset(filename: str, image_token: str):
-    """
-    根据 filename + image_token 返回图片原始二进制内容。
-
-    这是占位符映射的图片读取入口：
-    placeholder -> token -> PostgreSQL(chunk_images) -> local file -> bytes
-    """
-    record = chunk_image_storage.get_by_filename_and_token(filename, image_token)
-    if not record:
-        raise HTTPException(status_code=404, detail="图片记录不存在")
-
-    metadata = record.get("metadata") or {}
-    local_path = metadata.get("local_path")
-    if not local_path:
-        raise HTTPException(status_code=404, detail="图片本地路径不存在")
-
-    image_file = Path(local_path)
-    if not image_file.exists() or not image_file.is_file():
-        raise HTTPException(status_code=404, detail="图片文件不存在")
-
-    return FileResponse(
-        path=str(image_file),
-        media_type=record.get("mime_type") or "application/octet-stream",
-        filename=image_file.name,
-    )
-
-
 # =============================================================================
 # 会话管理 API
 # =============================================================================
@@ -271,35 +152,25 @@ async def get_session_messages(user_id: str, session_id: str):
     """
     try:
         data = storage._load()
-        user_sessions = data.get(user_id, {})
-        if session_id not in user_sessions:
+        if user_id not in data or session_id not in data[user_id]:
             return SessionMessagesResponse(messages=[])
 
-        session_data = user_sessions[session_id]
+        session_data = data[user_id][session_id]
         messages = []
 
         # 将存储的消息数据转换为 MessageInfo 对象
         for msg_data in session_data.get("messages", []):
-            if not isinstance(msg_data, dict):
-                continue
-            content = msg_data.get("content", "")
-            # content 可能是复杂结构（如多模态），需要转为字符串
-            if isinstance(content, (list, dict)):
-                import json
-                content = json.dumps(content)
             messages.append(MessageInfo(
-                type=msg_data.get("type", "human"),
-                content=str(content),
-                timestamp=msg_data.get("timestamp", ""),
-                rag_trace=msg_data.get("rag_trace")
+                type=msg_data["type"],
+                content=msg_data["content"],
+                timestamp=msg_data["timestamp"],
+                rag_trace=msg_data.get("rag_trace")  # 包含 RAG 检索的追踪信息
             ))
 
         return SessionMessagesResponse(messages=messages)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to load session messages: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/sessions/{user_id}", response_model=SessionListResponse)
@@ -315,12 +186,11 @@ async def list_sessions(user_id: str):
     """
     try:
         data = storage._load()
-        user_sessions = data.get(user_id, {})
-        if not user_sessions:
+        if user_id not in data:
             return SessionListResponse(sessions=[])
 
         sessions = []
-        for session_id, session_data in user_sessions.items():
+        for session_id, session_data in data[user_id].items():
             sessions.append(SessionInfo(
                 session_id=session_id,
                 updated_at=session_data.get("updated_at", ""),
@@ -332,9 +202,7 @@ async def list_sessions(user_id: str):
         return SessionListResponse(sessions=sessions)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to list sessions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/sessions/{user_id}/{session_id}", response_model=SessionDeleteResponse)
@@ -388,12 +256,7 @@ async def chat_endpoint(request: ChatRequest):
     """
     try:
         # 调用 Agent 服务处理消息
-        resp = chat_with_agent(
-            request.message,
-            request.user_id,
-            request.session_id,
-            request.image,
-        )
+        resp = chat_with_agent(request.message, request.user_id, request.session_id)
 
         # 将响应转换为 ChatResponse 格式
         if isinstance(resp, dict):
@@ -432,13 +295,11 @@ async def chat_stream_endpoint(request: ChatRequest):
         - message: 用户消息
         - user_id: 用户 ID
         - session_id: 会话 ID
-        - image: 图片 base64 编码字符串（可选）
 
     SSE 事件格式：
         - {"type": "content", "content": "..."}: 内容片段
         - {"type": "rag_step", "step": {...}}: RAG 检索步骤更新
         - {"type": "trace", "rag_trace": {...}}: RAG 追踪信息
-        - {"type": "image_hit", "images": [...]}: 图片检索结果
         - {"type": "error", "content": "..."}: 错误信息
         - [DONE]: 结束信号
 
@@ -453,8 +314,7 @@ async def chat_stream_endpoint(request: ChatRequest):
             async for chunk in chat_with_agent_stream(
                 request.message,
                 request.user_id,
-                request.session_id,
-                request.image,
+                request.session_id
             ):
                 yield chunk
         except Exception as e:
@@ -470,86 +330,6 @@ async def chat_stream_endpoint(request: ChatRequest):
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲，确保实时推送
         },
-    )
-
-
-# =============================================================================
-# 图片检索 API
-# =============================================================================
-
-class ImageSearchRequest(BaseModel):
-    """图片搜索请求模型"""
-    image: str  # base64 编码的图片数据
-    query: Optional[str] = ""  # 可选的文本查询
-    top_k: Optional[int] = 5
-
-
-class ImageHit(BaseModel):
-    """单张图片检索结果"""
-    image_id: str
-    image_token: str
-    placeholder: str
-    chunk_id: str
-    root_chunk_id: str
-    filename: str
-    page_number: int
-    mime_type: str
-    width: Optional[int]
-    height: Optional[int]
-    score: float
-    image_url: str  # 可访问的图片 URL
-
-
-class ImageSearchResponse(BaseModel):
-    """图片搜索响应"""
-    image_hits: List[ImageHit]
-    text_contexts: List[Dict[str, Any]]
-    meta: Dict[str, Any]
-
-
-@router.post("/images/search", response_model=ImageSearchResponse)
-async def search_images(request: ImageSearchRequest):
-    """
-    根据图片进行向量检索（以图搜图）。
-
-    请求体：
-        - image: 图片的 base64 编码字符串
-        - query: 可选的文本查询
-        - top_k: 返回结果数量
-
-    响应体：
-        - image_hits: 图片检索命中结果列表
-        - text_contexts: 关联的文本上下文
-        - meta: 检索元信息
-    """
-    from backend.rag.vector_store.retrieval_service import retrieve_images
-
-    # 将 base64 转换为字节
-    import base64
-    try:
-        image_bytes = base64.b64decode(request.image)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
-
-    # 执行图片检索
-    result = retrieve_images(image_bytes, top_k=request.top_k)
-
-    image_hits = result.get("image_hits", [])
-    text_contexts = result.get("text_contexts", [])
-
-    # 构建图片可访问 URL
-    enriched_hits = []
-    for hit in image_hits:
-        filename = hit.get("filename", "")
-        token = hit.get("image_token", "")
-        image_url = f"/images/{quote(filename, safe='')}/{token}"
-        hit["image_url"] = image_url
-        enriched_hits.append(ImageHit(**hit))
-
-    return ImageSearchResponse(
-        image_hits=enriched_hits,
-        text_contexts=text_contexts,
-        meta=result.get("meta", {}),
     )
 
 
@@ -737,9 +517,6 @@ async def delete_document(filename: str):
 
         # 从 PostgreSQL 删除父级分块数据
         parent_chunk_store.delete_by_filename(filename)
-
-        # 删除图片映射记录
-        chunk_image_storage.delete_by_filename(filename)
 
         return DocumentDeleteResponse(
             filename=filename,

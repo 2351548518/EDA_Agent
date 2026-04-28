@@ -28,12 +28,10 @@ class ChatRequest(BaseModel):
         message: 用户发送的消息内容
         user_id: 用户唯一标识（用于区分不同用户的数据）
         session_id: 会话唯一标识（用于区分同一用户的不同对话）
-        image: 图片原始字节（base64 编码字符串），用于以图搜图
     """
     message: str
     user_id: Optional[str] = "default_user"
     session_id: Optional[str] = "default_session"
-    image: Optional[str] = None  # base64 encoded image bytes
 
 
 # =============================================================================
@@ -51,8 +49,6 @@ class RetrievedChunk(BaseModel):
         score: 检索相关性得分（可选）
         rrf_rank: RRF 融合后的排名（可选）
         rerank_score: 重排序后的得分（可选）
-        images: 关联的图片列表（可选）
-        image_count: 图片数量（可选）
     """
     filename: str
     page_number: Optional[str | int] = None
@@ -60,36 +56,6 @@ class RetrievedChunk(BaseModel):
     score: Optional[float] = None
     rrf_rank: Optional[int] = None
     rerank_score: Optional[float] = None
-    images: Optional[List[dict]] = None
-    image_count: Optional[int] = None
-
-
-class RetrievedImage(BaseModel):
-    """
-    检索到的图片信息。
-
-    Attributes:
-        image_id: 图片唯一标识
-        image_token: 占位符 token
-        placeholder: 占位符字符串
-        chunk_id: 所属 chunk ID
-        filename: 来源文件名
-        page_number: 页码
-        mime_type: MIME 类型
-        width: 宽度
-        height: 高度
-        score: 检索得分
-    """
-    image_id: Optional[str] = None
-    image_token: Optional[str] = None
-    placeholder: Optional[str] = None
-    chunk_id: Optional[str] = None
-    filename: Optional[str] = None
-    page_number: Optional[int] = None
-    mime_type: Optional[str] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    score: Optional[float] = None
 
 
 class RagTrace(BaseModel):

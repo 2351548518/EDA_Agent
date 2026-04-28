@@ -49,9 +49,6 @@ _RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming
 # RAG 步骤队列所在的事件循环，用于跨线程调度
 _RAG_STEP_LOOP = None   # asyncio loop, captured when setting queue
 
-# 图片命中队列，用于推送图片检索结果
-_IMAGE_HIT_QUEUE = None  # asyncio.Queue, set by agent before streaming
-
 
 def _set_last_rag_context(context: dict):
     """
@@ -117,43 +114,6 @@ def set_rag_step_queue(queue):
     else:
         _RAG_STEP_LOOP = None
         print(f"[set_rag_step_queue] queue cleared")
-
-
-def set_image_hit_queue(queue):
-    """
-    设置图片命中队列，用于推送图片检索结果。
-
-    Args:
-        queue: asyncio.Queue 实例，用于接收图片命中结果
-    """
-    global _IMAGE_HIT_QUEUE
-    _IMAGE_HIT_QUEUE = queue
-    print(f"[set_image_hit_queue] queue set: {queue}")
-
-
-def emit_image_hits(images: list):
-    """
-    向队列发送图片命中结果。
-
-    Args:
-        images: 图片命中列表
-    """
-    global _IMAGE_HIT_QUEUE, _RAG_STEP_LOOP
-    if _IMAGE_HIT_QUEUE is None or _RAG_STEP_LOOP is None:
-        print(f"[emit_image_hits] QUEUE={_IMAGE_HIT_QUEUE}, LOOP={_RAG_STEP_LOOP}")
-        return
-
-    try:
-        if not _RAG_STEP_LOOP.is_closed():
-            # 跨线程安全地调度到主事件循环
-            _RAG_STEP_LOOP.call_soon_threadsafe(
-                _IMAGE_HIT_QUEUE.put_nowait,
-                {"type": "image_hit", "images": images}
-            )
-        else:
-            print(f"[emit_image_hits] loop is closed")
-    except Exception as e:
-        print(f"[emit_image_hits] error: {e}")
 
 
 def emit_rag_step(icon: str, label: str, detail: str = ""):
@@ -271,89 +231,6 @@ def get_current_weather(location: str, extensions: Optional[str] = "base") -> st
         return f"错误：解析天气数据失败 - {e}"
 
 
-@tool("search_by_image")
-def search_by_image(image_data: str, query: str = "") -> str:
-    """
-    在知识库中根据图片进行搜索（以图搜图）。
-
-    当用户发送图片时，使用此工具进行图片向量检索。
-
-    Args:
-        image_data: 图片的 base64 编码字符串（不带 data:image/...;base64, 前缀）
-        query: 可选的文本查询，用于结合图片进行多模态检索
-
-    Returns:
-        格式化的检索结果字符串，包含图片来源和关联文本上下文
-    """
-    from backend.rag.vector_store.retrieval_service import retrieve_images
-    from urllib.parse import quote
-
-    # 将 base64 转换为字节
-    import base64
-    try:
-        # 清理 base64 字符串中的空白字符
-        cleaned_data = "".join(image_data.split())
-        image_bytes = base64.b64decode(cleaned_data)
-
-        # 验证图片大小（限制 10MB）
-        max_size = 10 * 1024 * 1024
-        if len(image_bytes) > max_size:
-            return f"Image too large: {len(image_bytes)} bytes (max {max_size} bytes)"
-
-        # 验证是否为有效的图片（检查魔数）
-        if len(image_bytes) < 4:
-            return "Image data too small to be valid"
-
-        print(f"[search_by_image] Decoded image: {len(image_bytes)} bytes, starts with: {image_bytes[:20].hex()}")
-    except Exception as e:
-        return f"Invalid image data: {e}"
-
-    # 执行图片检索
-    try:
-        result = retrieve_images(image_bytes, top_k=5)
-    except Exception as e:
-        print(f"[search_by_image] retrieve_images error: {e}")
-        return f"Image retrieval failed: {e}"
-
-    image_hits = result.get("image_hits", [])
-    text_contexts = result.get("text_contexts", [])
-
-    # 为图片构建可访问的 URL 并发送 SSE 事件
-    if image_hits:
-        enriched_hits = []
-        for hit in image_hits:
-            filename = hit.get("filename", "")
-            token = hit.get("image_token", "")
-            hit["image_url"] = f"/images/{quote(filename, safe='')}/{token}"
-            enriched_hits.append(hit)
-        # 发送图片命中结果到 SSE
-        emit_image_hits(enriched_hits)
-    else:
-        emit_image_hits([])
-
-    if not image_hits:
-        return "No similar images found in the knowledge base."
-
-    # 格式化图片检索结果
-    formatted = []
-    for i, hit in enumerate(image_hits, 1):
-        source = hit.get("filename", "Unknown")
-        page = hit.get("page_number", "N/A")
-        score = hit.get("score", 0.0)
-        formatted.append(f"[Image {i}] {source} (Page {page}), Score: {score:.4f}")
-
-    # 添加文本上下文
-    if text_contexts:
-        formatted.append("\nRelated Text Contexts:")
-        for i, ctx in enumerate(text_contexts[:3], 1):
-            source = ctx.get("filename", "Unknown")
-            page = ctx.get("page_number", "N/A")
-            text = ctx.get("text", "")[:200]
-            formatted.append(f"[Text {i}] {source} (Page {page}):\n{text}...")
-
-    return "Image Search Results:\n" + "\n".join(formatted)
-
-
 @tool("search_knowledge_base")
 def search_knowledge_base(query: str) -> str:
     """
@@ -409,15 +286,6 @@ def search_knowledge_base(query: str) -> str:
         source = result.get("filename", "Unknown")
         page = result.get("page_number", "N/A")
         text = result.get("text", "")
-
-        # 检查是否有图片
-        images = result.get("images", [])
-        has_images = images and len(images) > 0
-
-        if has_images:
-            image_count = len(images)
-            text = f"{text}\n\n[Contains {image_count} image(s)]"
-
         formatted.append(f"[{i}] {source} (Page {page}):\n{text}")
 
     return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)

@@ -31,9 +31,9 @@ def reset_collection():
     else:
         print("✓ 无旧集合，跳过删除")
     
-    # 使用配置维度重建集合，需与 embedding 服务输出维度一致
-    print(f"正在创建新集合（向量维度: {manager.embedding_dim}）...")
-    manager.init_collection(dense_dim=manager.embedding_dim)
+    # 创建新集合（使用 Qwen3-VL-Embedding-8B 的维度 4096）
+    print("正在创建新集合（向量维度: 4096）...")
+    manager.init_collection(dense_dim=4096)
     print("✓ 新集合创建成功")
     
     print("\n========== 重置完成 ==========")

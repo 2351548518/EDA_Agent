@@ -27,11 +27,9 @@ from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk, Sys
 from backend.tools.agent_tools import (
     get_current_weather,
     search_knowledge_base,
-    search_by_image,
     get_last_rag_context,
     reset_tool_call_guards,
     set_rag_step_queue,
-    set_image_hit_queue,
 )
 
 # 导入对话存储
@@ -46,37 +44,6 @@ load_dotenv()
 API_KEY = os.getenv("ARK_API_KEY")
 MODEL = os.getenv("MODEL")
 BASE_URL = os.getenv("BASE_URL")
-
-
-def _detect_image_mime_type_from_base64(base64_data: str) -> str:
-    """
-    根据 base64 数据检测图片 MIME 类型。
-
-    Args:
-        base64_data: base64 编码的图片数据
-
-    Returns:
-        MIME 类型字符串，如 "image/jpeg", "image/png"
-    """
-    import base64
-    try:
-        # 清理空白字符
-        cleaned = "".join(base64_data.split())
-        # 解码前 20 个字节用于检测魔数
-        sample = base64.b64decode(cleaned[:32])
-        if len(sample) >= 3 and sample[:3] == b'\xff\xd8\xff':
-            return "image/jpeg"
-        if len(sample) >= 8 and sample[:8] == b'\x89PNG\r\n\x1a\n':
-            return "image/png"
-        if len(sample) >= 6 and sample[:6] in (b'GIF89a', b'GIF87a'):
-            return "image/gif"
-        if len(sample) >= 12 and sample[:4] == b'RIFF' and sample[8:12] == b'WEBP':
-            return "image/webp"
-        if len(sample) >= 2 and sample[:2] == b'BM':
-            return "image/bmp"
-        return "image/jpeg"  # 默认值
-    except Exception:
-        return "image/jpeg"
 
 
 def create_agent_instance():
@@ -105,7 +72,7 @@ def create_agent_instance():
     # 创建 Agent，传入 model、工具列表和系统提示词
     agent = create_agent(
         model=model,
-        tools=[get_current_weather, search_knowledge_base, search_by_image],
+        tools=[get_current_weather, search_knowledge_base],
         # 将 RAG 检索当成一个工具，agent 可以根据需要调用它来获取信息
         system_prompt=AGENT_SYSTEM_PROMPT,
     )
@@ -146,7 +113,7 @@ def summarize_old_messages(model, messages: list) -> str:
     return summary
 
 
-def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session", image_data: str = None):
+def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
     """
     使用 Agent 处理用户消息并返回响应（同步版本）。
 
@@ -162,7 +129,6 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
         user_text: 用户消息
         user_id: 用户 ID
         session_id: 会话 ID
-        image_data: 图片 base64 编码字符串（可选）
 
     Returns:
         dict: 包含 response 和 rag_trace 的字典
@@ -182,21 +148,8 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
             SystemMessage(content=f"之前的对话摘要：\n{summary}")
         ] + messages[40:]
 
-    # 构建用户消息内容（支持多模态）
-    if image_data:
-        # 多模态消息：文本 + 图片
-        import base64
-        mime_type = _detect_image_mime_type_from_base64(image_data)
-        image_url = f"data:{mime_type};base64,{image_data}"
-        user_content = [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
-    else:
-        user_content = user_text
-
     # 添加用户新消息
-    messages.append(HumanMessage(content=user_content))
+    messages.append(HumanMessage(content=user_text))
 
     # 调用 Agent 处理
     result = agent.invoke(
@@ -239,8 +192,7 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
 async def chat_with_agent_stream(
     user_text: str,
     user_id: str = "default_user",
-    session_id: str = "default_session",
-    image_data: str = None,
+    session_id: str = "default_session"
 ):
     """
     使用 Agent 处理用户消息并流式返回响应（异步 SSE 版本）。
@@ -290,12 +242,6 @@ async def chat_with_agent_stream(
     # 设置 RAG 步骤队列，并捕获当前事件循环以便跨线程调度
     set_rag_step_queue(_RAGStepProxy())
 
-    # 设置图片命中队列（用于接收 search_by_image 工具的图片结果）
-    class _ImageHitProxy:
-        def put_nowait(self, data):
-            output_queue.put_nowait(data)
-    set_image_hit_queue(_ImageHitProxy())
-
     # 如果对话过长，进行摘要压缩
     if len(messages) > 50:
         summary = summarize_old_messages(model, messages[:40])
@@ -304,19 +250,7 @@ async def chat_with_agent_stream(
         ] + messages[40:]
 
     # 添加用户消息
-    if image_data:
-        # 多模态消息：文本 + 图片
-        import base64
-        mime_type = _detect_image_mime_type_from_base64(image_data)
-        image_url = f"data:{mime_type};base64,{image_data}"
-        user_content = [
-            {"type": "text", "text": user_text},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
-    else:
-        user_content = user_text
-
-    messages.append(HumanMessage(content=user_content))
+    messages.append(HumanMessage(content=user_text))
 
     full_response = ""  # 完整回复，用于最后保存
 
@@ -395,7 +329,6 @@ async def chat_with_agent_stream(
     finally:
         # 正常结束或异常退出时清理
         set_rag_step_queue(None)
-        set_image_hit_queue(None)
         if not agent_task.done():
             agent_task.cancel()
 

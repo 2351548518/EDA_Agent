@@ -162,7 +162,7 @@ def grade_documents_node(state: RAGState) -> RAGState:
     prompt = RAG_GRADE_PROMPT.format(question=question, context=context)
 
     # 调用 LLM 进行评估
-    response = grader.with_structured_output(GradeDocuments, include_raw=False).invoke(
+    response = grader.with_structured_output(GradeDocuments).invoke(
         [{"role": "user", "content": prompt}]
     )
     score = (response.score or "").strip().lower()
@@ -210,7 +210,7 @@ def rewrite_question_node(state: RAGState) -> RAGState:
     if router:
         prompt = RAG_REWRITE_STRATEGY_PROMPT_TEMPLATE.format(question=question)
         try:
-            decision = router.with_structured_output(RewriteStrategy, include_raw=False).invoke(
+            decision = router.with_structured_output(RewriteStrategy).invoke(
                 [{"role": "user", "content": prompt}]
             )
             strategy = decision.strategy

@@ -45,7 +45,7 @@ def get_grader_model():
             api_key=API_KEY,
             base_url=BASE_URL,
             temperature=0,  # 评估使用确定性的回答
-            stream_usage=False,
+            stream_usage=True,
         )
     return _grader_model
 
@@ -69,6 +69,6 @@ def get_router_model():
             api_key=API_KEY,
             base_url=BASE_URL,
             temperature=0,  # 路由使用确定性的回答
-            stream_usage=False,
+            stream_usage=True,
         )
     return _router_model

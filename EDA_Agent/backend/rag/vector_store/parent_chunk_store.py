@@ -34,18 +34,6 @@ class ParentChunkStore:
         # 确保表结构存在
         self._ensure_schema()
 
-    @staticmethod
-    def _sanitize_text(value: str) -> str:
-        """
-        清理 PostgreSQL text/jsonb 不接受的空字节。
-
-        PostgreSQL 不允许在 text/json 字段中包含 "\\x00"，
-        PDF 解析文本中偶发该字符时会导致写入失败。
-        """
-        if not isinstance(value, str):
-            return value
-        return value.replace("\x00", "")
-
     def _load(self) -> Dict[str, dict]:
         """
         加载所有父级分块（调试用）。
@@ -86,14 +74,14 @@ class ParentChunkStore:
 
                     # 构建 payload（包含分块的完整信息）
                     payload = {
-                        "text": self._sanitize_text(doc.get("text", "")),
-                        "filename": self._sanitize_text(doc.get("filename", "")),
-                        "file_type": self._sanitize_text(doc.get("file_type", "")),
-                        "file_path": self._sanitize_text(doc.get("file_path", "")),
+                        "text": doc.get("text", ""),
+                        "filename": doc.get("filename", ""),
+                        "file_type": doc.get("file_type", ""),
+                        "file_path": doc.get("file_path", ""),
                         "page_number": doc.get("page_number", 0),
-                        "chunk_id": self._sanitize_text(chunk_id),
-                        "parent_chunk_id": self._sanitize_text(doc.get("parent_chunk_id", "")),
-                        "root_chunk_id": self._sanitize_text(doc.get("root_chunk_id", "")),
+                        "chunk_id": chunk_id,
+                        "parent_chunk_id": doc.get("parent_chunk_id", ""),
+                        "root_chunk_id": doc.get("root_chunk_id", ""),
                         "chunk_level": int(doc.get("chunk_level", 0) or 0),
                         "chunk_idx": int(doc.get("chunk_idx", 0) or 0),
                     }
